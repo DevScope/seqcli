@@ -14,6 +14,7 @@
 
 using System;
 using System.Buffers;
+using System.Collections;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
@@ -29,6 +30,7 @@ using SeqCli.Api;
 using SeqCli.Config;
 using SeqCli.Forwarder.Channel;
 using SeqCli.Forwarder.Diagnostics;
+using SeqCli.PlainText.LogEvents;
 using JsonException = System.Text.Json.JsonException;
 
 namespace SeqCli.Forwarder.Web.Api;
@@ -45,7 +47,7 @@ class IngestionEndpoints : IMapEndpoints
         _forwardingChannels = forwardingChannels;
         _config = config;
     }
-    
+
     public void MapEndpoints(WebApplication app)
     {
         app.MapPost("ingest/clef", (Delegate) (async (HttpContext context) => await IngestCompactFormatAsync(context)));
@@ -63,15 +65,17 @@ class IngestionEndpoints : IMapEndpoints
 
         if (contentType != null && contentType.StartsWith(clefMediaType)) return await IngestCompactFormatAsync(context);
 
-        IngestionLog.ForClient(context.Connection.RemoteIpAddress)
-            .Error("Client supplied a legacy raw-format (non-CLEF) payload");
-        return Error(HttpStatusCode.BadRequest, "Only newline-delimited JSON (CLEF) payloads are supported.");
+        return await IngestLegacyRawFormatAsync(context);
+
+        // IngestionLog.ForClient(context.Connection.RemoteIpAddress)
+        //     .Error("Client supplied a legacy raw-format (non-CLEF) payload");
+        // return Error(HttpStatusCode.BadRequest, "Only newline-delimited JSON (CLEF) payloads are supported.");
     }
-    
+
     async Task<IResult> IngestCompactFormatAsync(HttpContext context)
     {
         byte[]? rented = null;
-        
+
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
@@ -177,6 +181,135 @@ class IngestionEndpoints : IMapEndpoints
         }
     }
 
+    async Task<IResult> IngestLegacyRawFormatAsync(HttpContext context)
+    {
+        byte[]? rented = null;
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var requestApiKey = GetApiKey(context.Request);
+            var log = _forwardingChannels.GetForwardingChannel(requestApiKey);
+
+            // Add one for the extra newline that we have to insert at the end of batches.
+            var bufferSize = _config.Connection.BatchSizeLimitBytes + 1;
+            rented = ArrayPool<byte>.Shared.Rent(bufferSize);
+            var buffer = new ArraySegment<byte>(rented, 0, bufferSize);
+            var writeHead = 0;
+            var readHead = 0;
+
+            var done = false;
+            while (!done)
+            {
+                // Fill the memory buffer from as much of the incoming request payload as possible; buffering in memory increases the
+                // size of write batches.
+                while (!done)
+                {
+                    var remaining = buffer.Count - 1 - writeHead;
+                    if (remaining == 0)
+                    {
+                        IngestionLog.ForClient(context.Connection.RemoteIpAddress)
+                            .Error("An incoming request exceeded the configured batch size limit");
+                        return Error(HttpStatusCode.RequestEntityTooLarge, "the request is too large to process");
+                    }
+
+                    var read = await context.Request.Body.ReadAsync(buffer.AsMemory(writeHead, remaining), cts.Token);
+                    if (read == 0)
+                    {
+                        done = true;
+                    }
+
+                    writeHead += read;
+
+                    // Ingested batches must be terminated with `\n`, but this isn't an API requirement.
+                    if (done && writeHead > 0 && writeHead < buffer.Count && buffer[writeHead - 1] != (byte)'\n')
+                    {
+                        buffer[writeHead] = (byte)'\n';
+                        writeHead += 1;
+                    }
+                }
+
+                // Validate what we read, marking out a batch of one or more complete newline-delimited events.
+                var batchStart = readHead;
+                var batchEnd = readHead;
+                while (batchEnd < writeHead)
+                {
+                    var eventStart = batchEnd;
+                    var nlIndex = buffer.AsSpan()[eventStart..].IndexOf((byte)'\n');
+
+                    if (nlIndex == -1)
+                    {
+                        break;
+                    }
+
+                    var eventEnd = eventStart + nlIndex + 1;
+
+                    batchEnd = eventEnd;
+                    readHead = batchEnd;
+
+                    if (!ValidateRaw(buffer.AsSpan()[eventStart..eventEnd], out var error))
+                    {
+                        var payloadText = Encoding.UTF8.GetString(buffer.AsSpan()[eventStart..eventEnd]);
+                        IngestionLog.ForPayload(context.Connection.RemoteIpAddress, payloadText)
+                            .Error("Payload validation failed: {Error}", error);
+                        return Error(HttpStatusCode.BadRequest, $"Payload validation failed: {error}.");
+                    }
+                }
+
+                if (batchStart != batchEnd)
+                {
+                    var rawSpan = buffer[batchStart..batchEnd];
+                    var jsonDoc = JsonDocument.Parse(rawSpan.ToArray());
+                    var events = new ArrayList();
+                    // Parse raw json to extract events
+                    foreach (var element in jsonDoc.RootElement.EnumerateObject())
+                    {
+                        if(element.Name == "events" || element.Name == "Events")
+                            foreach(var rec in element.Value.EnumerateArray())
+                               events.Add(rec);
+                    }
+                    // Convert to CLEF
+                    foreach (JsonElement evt in events)
+                    {
+                        var serilogEvent = evt.EnumerateObject().ToDictionary(p => p.Name, p => (object?)p.Value); 
+                        var eventId = "";
+                        var eventType = 0u;
+                        Serilog.Events.LogEvent serilogLogEvent = LogEventBuilder.FromProperties(serilogEvent, null);
+                        var logEvent = Apps.Hosting.EventFormat.FromRaw(eventId, eventType, serilogLogEvent);
+                        // serialise logEvent to byte array kind of buffer
+                        var clefArray = Utf8.GetBytes(""); // TODO: serialize logEvent to CLEF byte array
+                        await log.WriteAsync(clefArray, cts.Token);
+                    }
+                }
+
+                // Copy any unprocessed data into our buffer and continue
+                if (!done && readHead != 0)
+                {
+                    var retain = writeHead - readHead;
+                    buffer.AsSpan()[readHead..writeHead].CopyTo(buffer.AsSpan()[..retain]);
+                    readHead = 0;
+                    writeHead = retain;
+                }
+            }
+
+            return SuccessfulIngestion();
+        }
+        catch (Exception ex)
+        {
+            IngestionLog.ForClient(context.Connection.RemoteIpAddress)
+                .Error(ex, "Ingestion failed");
+            return Error(HttpStatusCode.InternalServerError, "Ingestion failed.");
+        }
+        finally
+        {
+            if (rented != null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+    }
     static bool DefaultedBoolQuery(HttpRequest request, string queryParameterName)
     {
         var parameter = request.Query[queryParameterName];
@@ -207,13 +340,13 @@ class IngestionEndpoints : IMapEndpoints
     {
         // Note that `errorFragment` does not include user-supplied values; we opt in to adding this to
         // the ingestion log and include it using `ForPayload()`.
-        
+
         if (evt.Length > _config.Connection.EventSizeLimitBytes)
         {
             errorFragment = "an event exceeds the configured size limit";
             return false;
         }
-        
+
         var reader = new Utf8JsonReader(evt);
 
         var foundTimestamp = false;
@@ -269,7 +402,39 @@ class IngestionEndpoints : IMapEndpoints
         errorFragment = null;
         return true;
     }
-    
+
+    bool ValidateRaw(Span<byte> evt, [NotNullWhen(false)] out string? errorFragment)
+    {
+        // Note that `errorFragment` does not include user-supplied values; we opt in to adding this to
+        // the ingestion log and include it using `ForPayload()`.
+
+        if (evt.Length > _config.Connection.EventSizeLimitBytes)
+        {
+            errorFragment = "an event exceeds the configured size limit";
+            return false;
+        }
+
+        try
+        {
+
+            var jsonDoc = JsonDocument.Parse(evt.ToArray());
+            if (!(jsonDoc.RootElement.TryGetProperty("events", out var eventsToken) ||
+                  jsonDoc.RootElement.TryGetProperty("Events", out eventsToken)))
+            {
+                errorFragment = "events were not found in raw payload";
+                return false;
+            }
+        }
+        catch (JsonException)
+        {
+            errorFragment = "JSON parsing failure";
+            return false;
+        }
+
+        errorFragment = null;
+        return true;
+    }
+
     static IResult Error(HttpStatusCode statusCode, string message)
     {
         return Results.Json(new ErrorPart { Error = message }, statusCode: (int)statusCode);
@@ -279,8 +444,8 @@ class IngestionEndpoints : IMapEndpoints
     {
         return TypedResults.Content(
             "{}",
-            "application/json", 
-            Utf8, 
+            "application/json",
+            Utf8,
             StatusCodes.Status201Created);
     }
 }
