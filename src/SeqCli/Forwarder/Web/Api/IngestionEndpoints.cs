@@ -14,8 +14,8 @@
 
 using System;
 using System.Buffers;
-using System.Collections;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
@@ -30,7 +30,6 @@ using SeqCli.Api;
 using SeqCli.Config;
 using SeqCli.Forwarder.Channel;
 using SeqCli.Forwarder.Diagnostics;
-using SeqCli.PlainText.LogEvents;
 using JsonException = System.Text.Json.JsonException;
 
 namespace SeqCli.Forwarder.Web.Api;
@@ -262,25 +261,28 @@ class IngestionEndpoints : IMapEndpoints
                 {
                     var rawSpan = buffer[batchStart..batchEnd];
                     var jsonDoc = JsonDocument.Parse(rawSpan.ToArray());
-                    var events = new ArrayList();
+                    
                     // Parse raw json to extract events
+                    JsonElement eventsArray = default;
                     foreach (var element in jsonDoc.RootElement.EnumerateObject())
                     {
-                        if(element.Name == "events" || element.Name == "Events")
-                            foreach(var rec in element.Value.EnumerateArray())
-                               events.Add(rec);
+                        if (element.Name == "events" || element.Name == "Events")
+                        {
+                            eventsArray = element.Value;
+                            break;
+                        }
                     }
-                    // Convert to CLEF
-                    foreach (JsonElement evt in events)
+                    
+                    // Convert each legacy event to CLEF
+                    using var clefStream = new MemoryStream();
+                    foreach (var evt in eventsArray.EnumerateArray())
                     {
-                        var serilogEvent = evt.EnumerateObject().ToDictionary(p => p.Name, p => (object?)p.Value); 
-                        var eventId = "";
-                        var eventType = 0u;
-                        Serilog.Events.LogEvent serilogLogEvent = LogEventBuilder.FromProperties(serilogEvent, null);
-                        var logEvent = Apps.Hosting.EventFormat.FromRaw(eventId, eventType, serilogLogEvent);
-                        // serialise logEvent to byte array kind of buffer
-                        var clefArray = Utf8.GetBytes(""); // TODO: serialize logEvent to CLEF byte array
-                        await log.WriteAsync(clefArray, cts.Token);
+                        ConvertLegacyEventToClef(evt, clefStream);
+                    }
+                    
+                    if (clefStream.Length > 0)
+                    {
+                        await log.WriteAsync(clefStream.ToArray(), cts.Token);
                     }
                 }
 
@@ -310,6 +312,126 @@ class IngestionEndpoints : IMapEndpoints
             }
         }
     }
+
+    static void ConvertLegacyEventToClef(JsonElement legacyEvent, Stream output)
+    {
+        using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { SkipValidation = true });
+        writer.WriteStartObject();
+
+        string? timestamp = null;
+        string? level = null;
+        string? messageTemplate = null;
+        string? exception = null;
+        JsonElement? properties = null;
+
+        // Extract known fields from legacy event
+        foreach (var prop in legacyEvent.EnumerateObject())
+        {
+            switch (prop.Name)
+            {
+                case "Timestamp":
+                    timestamp = prop.Value.GetString();
+                    break;
+                case "Level":
+                    level = prop.Value.GetString();
+                    break;
+                case "MessageTemplate":
+                    messageTemplate = prop.Value.GetString();
+                    break;
+                case "Exception":
+                    if (prop.Value.ValueKind != JsonValueKind.Null)
+                        exception = prop.Value.GetString();
+                    break;
+                case "Properties":
+                    properties = prop.Value;
+                    break;
+            }
+        }
+
+        // Write CLEF fields
+        if (!string.IsNullOrEmpty(timestamp))
+        {
+            writer.WriteString("@t", timestamp);
+        }
+
+        if (!string.IsNullOrEmpty(level))
+        {
+            writer.WriteString("@l", level);
+        }
+
+        if (!string.IsNullOrEmpty(messageTemplate))
+        {
+            writer.WriteString("@mt", messageTemplate);
+        }
+
+        if (!string.IsNullOrEmpty(exception))
+        {
+            writer.WriteString("@x", exception);
+        }
+
+        // Write properties as top-level fields
+        if (properties.HasValue)
+        {
+            foreach (var prop in properties.Value.EnumerateObject())
+            {
+                writer.WritePropertyName(prop.Name);
+                WriteJsonElement(writer, prop.Value);
+            }
+        }
+
+        writer.WriteEndObject();
+        writer.Flush();
+        
+        // Write newline after each event
+        output.WriteByte((byte)'\n');
+    }
+
+    static void WriteJsonElement(Utf8JsonWriter writer, JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var prop in element.EnumerateObject())
+                {
+                    writer.WritePropertyName(prop.Name);
+                    WriteJsonElement(writer, prop.Value);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in element.EnumerateArray())
+                {
+                    WriteJsonElement(writer, item);
+                }
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(element.GetString());
+                break;
+            case JsonValueKind.Number:
+                if (element.TryGetInt32(out var intValue))
+                    writer.WriteNumberValue(intValue);
+                else if (element.TryGetInt64(out var longValue))
+                    writer.WriteNumberValue(longValue);
+                else if (element.TryGetDouble(out var doubleValue))
+                    writer.WriteNumberValue(doubleValue);
+                else
+                    writer.WriteRawValue(element.GetRawText());
+                break;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                break;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                break;
+            case JsonValueKind.Null:
+                writer.WriteNullValue();
+                break;
+        }
+    }
+
     static bool DefaultedBoolQuery(HttpRequest request, string queryParameterName)
     {
         var parameter = request.Query[queryParameterName];
