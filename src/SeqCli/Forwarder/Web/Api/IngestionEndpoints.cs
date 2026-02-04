@@ -182,8 +182,6 @@ class IngestionEndpoints : IMapEndpoints
 
     async Task<IResult> IngestLegacyRawFormatAsync(HttpContext context)
     {
-        byte[]? rented = null;
-
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
@@ -192,108 +190,49 @@ class IngestionEndpoints : IMapEndpoints
             var requestApiKey = GetApiKey(context.Request);
             var log = _forwardingChannels.GetForwardingChannel(requestApiKey);
 
-            // Add one for the extra newline that we have to insert at the end of batches.
-            var bufferSize = _config.Connection.BatchSizeLimitBytes + 1;
-            rented = ArrayPool<byte>.Shared.Rent(bufferSize);
-            var buffer = new ArraySegment<byte>(rented, 0, bufferSize);
-            var writeHead = 0;
-            var readHead = 0;
+            // Read the entire request body
+            using var reader = new StreamReader(context.Request.Body);
+            var requestBody = await reader.ReadToEndAsync(cts.Token);
 
-            var done = false;
-            while (!done)
+            // Validate and parse the legacy raw format
+            JsonDocument jsonDoc;
+            try
             {
-                // Fill the memory buffer from as much of the incoming request payload as possible; buffering in memory increases the
-                // size of write batches.
-                while (!done)
-                {
-                    var remaining = buffer.Count - 1 - writeHead;
-                    if (remaining == 0)
-                    {
-                        IngestionLog.ForClient(context.Connection.RemoteIpAddress)
-                            .Error("An incoming request exceeded the configured batch size limit");
-                        return Error(HttpStatusCode.RequestEntityTooLarge, "the request is too large to process");
-                    }
+                jsonDoc = JsonDocument.Parse(requestBody);
+            }
+            catch (JsonException)
+            {
+                IngestionLog.ForPayload(context.Connection.RemoteIpAddress, requestBody)
+                    .Error("Payload validation failed: JSON parsing failure");
+                return Error(HttpStatusCode.BadRequest, "Payload validation failed: JSON parsing failure.");
+            }
 
-                    var read = await context.Request.Body.ReadAsync(buffer.AsMemory(writeHead, remaining), cts.Token);
-                    if (read == 0)
-                    {
-                        done = true;
-                    }
+            // Extract events array
+            if (!jsonDoc.RootElement.TryGetProperty("Events", out var eventsArray) &&
+                !jsonDoc.RootElement.TryGetProperty("events", out eventsArray))
+            {
+                IngestionLog.ForPayload(context.Connection.RemoteIpAddress, requestBody)
+                    .Error("Payload validation failed: events were not found in raw payload");
+                return Error(HttpStatusCode.BadRequest, "Payload validation failed: events were not found in raw payload.");
+            }
 
-                    writeHead += read;
+            if (eventsArray.ValueKind != JsonValueKind.Array)
+            {
+                IngestionLog.ForPayload(context.Connection.RemoteIpAddress, requestBody)
+                    .Error("Payload validation failed: events must be an array");
+                return Error(HttpStatusCode.BadRequest, "Payload validation failed: events must be an array.");
+            }
 
-                    // Ingested batches must be terminated with `\n`, but this isn't an API requirement.
-                    if (done && writeHead > 0 && writeHead < buffer.Count && buffer[writeHead - 1] != (byte)'\n')
-                    {
-                        buffer[writeHead] = (byte)'\n';
-                        writeHead += 1;
-                    }
-                }
+            // Convert each legacy event to CLEF
+            using var clefStream = new MemoryStream();
+            foreach (var evt in eventsArray.EnumerateArray())
+            {
+                ConvertLegacyEventToClef(evt, clefStream);
+            }
 
-                // Validate what we read, marking out a batch of one or more complete newline-delimited events.
-                var batchStart = readHead;
-                var batchEnd = readHead;
-                while (batchEnd < writeHead)
-                {
-                    var eventStart = batchEnd;
-                    var nlIndex = buffer.AsSpan()[eventStart..].IndexOf((byte)'\n');
-
-                    if (nlIndex == -1)
-                    {
-                        break;
-                    }
-
-                    var eventEnd = eventStart + nlIndex + 1;
-
-                    batchEnd = eventEnd;
-                    readHead = batchEnd;
-
-                    if (!ValidateRaw(buffer.AsSpan()[eventStart..eventEnd], out var error))
-                    {
-                        var payloadText = Encoding.UTF8.GetString(buffer.AsSpan()[eventStart..eventEnd]);
-                        IngestionLog.ForPayload(context.Connection.RemoteIpAddress, payloadText)
-                            .Error("Payload validation failed: {Error}", error);
-                        return Error(HttpStatusCode.BadRequest, $"Payload validation failed: {error}.");
-                    }
-                }
-
-                if (batchStart != batchEnd)
-                {
-                    var rawSpan = buffer[batchStart..batchEnd];
-                    var jsonDoc = JsonDocument.Parse(rawSpan.ToArray());
-                    
-                    // Parse raw json to extract events
-                    JsonElement eventsArray = default;
-                    foreach (var element in jsonDoc.RootElement.EnumerateObject())
-                    {
-                        if (element.Name == "events" || element.Name == "Events")
-                        {
-                            eventsArray = element.Value;
-                            break;
-                        }
-                    }
-                    
-                    // Convert each legacy event to CLEF
-                    using var clefStream = new MemoryStream();
-                    foreach (var evt in eventsArray.EnumerateArray())
-                    {
-                        ConvertLegacyEventToClef(evt, clefStream);
-                    }
-                    
-                    if (clefStream.Length > 0)
-                    {
-                        await log.WriteAsync(clefStream.ToArray(), cts.Token);
-                    }
-                }
-
-                // Copy any unprocessed data into our buffer and continue
-                if (!done && readHead != 0)
-                {
-                    var retain = writeHead - readHead;
-                    buffer.AsSpan()[readHead..writeHead].CopyTo(buffer.AsSpan()[..retain]);
-                    readHead = 0;
-                    writeHead = retain;
-                }
+            if (clefStream.Length > 0)
+            {
+                await log.WriteAsync(clefStream.ToArray(), cts.Token);
             }
 
             return SuccessfulIngestion();
@@ -303,13 +242,6 @@ class IngestionEndpoints : IMapEndpoints
             IngestionLog.ForClient(context.Connection.RemoteIpAddress)
                 .Error(ex, "Ingestion failed");
             return Error(HttpStatusCode.InternalServerError, "Ingestion failed.");
-        }
-        finally
-        {
-            if (rented != null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
         }
     }
 
